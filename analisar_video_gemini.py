@@ -1,6 +1,8 @@
 import csv, os, re, sys, time
 from pathlib import Path
 from google import genai
+import random
+from google.genai import errors
 
 SYSTEM = r'''Você é analista industrial de tempos e movimentos. Analise integralmente o vídeo, cubra toda a linha temporal e registre uma atividade por linha. Não invente nem presuma ações, ferramentas, materiais, intenções ou causas. Use "Não visível" quando a ação estiver oculta e "Não identificável" quando estiver visível mas não puder ser determinada.
 Classifique: UT quando transforma, monta, conecta, fixa ou ajusta diretamente o produto; CNVA quando não transforma, mas é necessária e normalmente cíclica; FNVA quando é apoio necessário ocasional ou frequencial; TBD quando não houver evidência suficiente, houver espera/paralisação de causa desconhecida ou a ação não puder ser classificada. DT não é classificação.
@@ -32,12 +34,187 @@ def main():
     videos=[Path(x.strip().lstrip('\ufeff')) for x in manifest.read_text(encoding='utf-8-sig').splitlines() if x.strip()]
     final=[]; offset=0
     for idx,video in enumerate(videos,1):
-        print(f'Enviando parte {idx}/{len(videos)}: {video.name}',file=sys.stderr)
-        f=client.files.upload(file=str(video))
-        while not f.state or f.state.name=='PROCESSING':
-            time.sleep(5); f=client.files.get(name=f.name)
-        if f.state.name!='ACTIVE': raise RuntimeError(f'Upload falhou: {f.state.name}')
-        r=client.models.generate_content(model=model,contents=[f,PROMPT],config={'system_instruction':SYSTEM,'temperature':0,'max_output_tokens':65536})
+        print(
+            f"[{idx}/{len(videos)}] {video.name} | Iniciando upload...",
+            file=sys.stderr,
+            flush=True
+        )
+
+        upload_inicio = time.time()
+
+        try:
+            f = client.files.upload(file=str(video))
+        except Exception as e:
+            print(
+                f"[{idx}/{len(videos)}] {video.name} | ERRO NO UPLOAD: {e}",
+                file=sys.stderr,
+                flush=True
+            )
+            raise
+
+        print(
+            f"[{idx}/{len(videos)}] {video.name} | Upload concluído "
+            f"({time.time() - upload_inicio:.1f}s)",
+            file=sys.stderr,
+            flush=True
+        )
+
+        # ============================================================
+        # Aguardar processamento do vídeo pelo Gemini
+        # ============================================================
+
+        processamento_inicio = time.time()
+        ultima_mensagem = 0
+        TIMEOUT_PROCESSAMENTO = 30 * 60  # 30 minutos
+
+        while True:
+
+            f = client.files.get(name=f.name)
+
+            estado = f.state.name if f.state else "DESCONHECIDO"
+
+            agora = time.time()
+            decorrido = agora - processamento_inicio
+
+            # Mostra status aproximadamente a cada 10 segundos
+            if agora - ultima_mensagem >= 10:
+                print(
+                    f"[{idx}/{len(videos)}] {video.name} | "
+                    f"Gemini: {estado} | "
+                    f"{decorrido:.0f}s",
+                    file=sys.stderr,
+                    flush=True
+                )
+
+                ultima_mensagem = agora
+
+            if estado == "ACTIVE":
+                break
+
+            if estado == "FAILED":
+                erro = getattr(f, "error", None)
+
+                raise RuntimeError(
+                    f"Gemini falhou ao processar {video.name}. "
+                    f"Erro: {erro}"
+                )
+
+            if decorrido > TIMEOUT_PROCESSAMENTO:
+
+                raise TimeoutError(
+                    f"Timeout aguardando processamento de {video.name} "
+                    f"após {decorrido:.0f}s."
+                )
+
+            time.sleep(5)
+
+
+        print(
+            f"[{idx}/{len(videos)}] {video.name} | "
+            f"Vídeo ACTIVE. Iniciando análise...",
+            file=sys.stderr,
+            flush=True
+        )
+
+
+        # ============================================================
+        # Executar análise
+        # ============================================================
+
+        analise_inicio = time.time()
+
+        MAX_TENTATIVAS = 6
+
+        for tentativa in range(1, MAX_TENTATIVAS + 1):
+
+            print(
+                f"[{idx}/{len(videos)}] {video.name} | "
+                f"Iniciando análise | tentativa "
+                f"{tentativa}/{MAX_TENTATIVAS}",
+                file=sys.stderr,
+                flush=True
+            )
+
+            analise_inicio = time.time()
+
+            try:
+
+                r = client.models.generate_content(
+                    model=model,
+                    contents=[f, PROMPT],
+                    config={
+                        "system_instruction": SYSTEM,
+                        "temperature": 0,
+                        "max_output_tokens": 65536
+                    }
+                )
+
+                print(
+                    f"[{idx}/{len(videos)}] {video.name} | "
+                    f"Análise concluída "
+                    f"({time.time() - analise_inicio:.1f}s)",
+                    file=sys.stderr,
+                    flush=True
+                )
+
+                # Deu certo. Sai do loop de retry.
+                break
+
+            except errors.ServerError as e:
+
+                # Captura principalmente erros 5xx do servidor.
+                status = getattr(e, "code", None)
+
+                print(
+                    f"[{idx}/{len(videos)}] {video.name} | "
+                    f"Erro temporário do Gemini: {status or e}",
+                    file=sys.stderr,
+                    flush=True
+                )
+
+                if tentativa >= MAX_TENTATIVAS:
+                    print(
+                        f"[{idx}/{len(videos)}] {video.name} | "
+                        f"ERRO: limite de tentativas atingido.",
+                        file=sys.stderr,
+                        flush=True
+                    )
+                    raise
+
+                # Backoff exponencial com jitter:
+                # aproximadamente 5, 10, 20, 40, 80... segundos
+                espera_base = min(5 * (2 ** (tentativa - 1)), 120)
+                espera = espera_base + random.uniform(0, 3)
+
+                print(
+                    f"[{idx}/{len(videos)}] {video.name} | "
+                    f"Nova tentativa após {espera:.1f}s...",
+                    file=sys.stderr,
+                    flush=True
+                )
+
+                time.sleep(espera)
+
+            except Exception as e:
+
+                # Erros inesperados não ficam sendo repetidos indefinidamente.
+                print(
+                    f"[{idx}/{len(videos)}] {video.name} | "
+                    f"ERRO NÃO RECUPERÁVEL NA ANÁLISE: {e}",
+                    file=sys.stderr,
+                    flush=True
+                )
+
+                raise
+
+        print(
+            f"[{idx}/{len(videos)}] {video.name} | "
+            f"Análise concluída "
+            f"({time.time() - analise_inicio:.1f}s). "
+            f"Validando CSV...",
+            file=sys.stderr,
+            flush=True
+        )
         rows=list(csv.reader(clean(r.text).splitlines()))
         if len(rows)<2: raise ValueError(f'Parte {idx} sem atividades')
         for row in rows[1:]:
