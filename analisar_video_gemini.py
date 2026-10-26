@@ -23,7 +23,9 @@ def clean(text):
 
 def main():
     if len(sys.argv)!=4: raise SystemExit('uso: analisar_video_gemini.py partes.txt saida.csv modelo')
-    manifest,out,model=map(Path,sys.argv[1:])
+    manifest = Path(sys.argv[1])
+    out = Path(sys.argv[2])
+    model = sys.argv[3]
     key=os.getenv('GEMINI_API_KEY')
     if not key: raise SystemExit('GEMINI_API_KEY nao definida')
     client=genai.Client(api_key=key)
