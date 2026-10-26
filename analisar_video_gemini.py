@@ -27,7 +27,7 @@ def main():
     if len(sys.argv)!=4: raise SystemExit('uso: analisar_video_gemini.py partes.txt saida.csv modelo')
     manifest = Path(sys.argv[1])
     out = Path(sys.argv[2])
-    model = sys.argv[3]
+    model = "gemini-3.8-flash"
     key=os.getenv('GEMINI_API_KEY')
     if not key: raise SystemExit('GEMINI_API_KEY nao definida')
     client=genai.Client(api_key=key)
@@ -123,14 +123,16 @@ def main():
 
         analise_inicio = time.time()
 
-        MAX_TENTATIVAS = 6
+        MAX_TENTATIVAS = 8
+
+        resposta_texto = None
 
         for tentativa in range(1, MAX_TENTATIVAS + 1):
 
             print(
                 f"[{idx}/{len(videos)}] {video.name} | "
-                f"Iniciando análise | tentativa "
-                f"{tentativa}/{MAX_TENTATIVAS}",
+                f"Iniciando análise pela Interactions API | "
+                f"tentativa {tentativa}/{MAX_TENTATIVAS}",
                 file=sys.stderr,
                 flush=True
             )
@@ -139,15 +141,32 @@ def main():
 
             try:
 
-                r = client.models.generate_content(
+                interaction = client.interactions.create(
                     model=model,
-                    contents=[f, PROMPT],
-                    config={
-                        "system_instruction": SYSTEM,
-                        "temperature": 0,
-                        "max_output_tokens": 65536
-                    }
+                    input=[
+                        {
+                            "type": "video",
+                            "uri": f.uri,
+                            "mime_type": f.mime_type,
+                        },
+                        {
+                            "type": "text",
+                            "text": PROMPT,
+                        },
+                    ],
+                    system_instruction=SYSTEM,
+                    generation_config={
+                        "max_output_tokens": 65536,
+                        "thinking_level": "medium",
+                    },
                 )
+
+                resposta_texto = interaction.output_text
+
+                if not resposta_texto or not resposta_texto.strip():
+                    raise ValueError(
+                        "A Interactions API retornou uma resposta vazia."
+                    )
 
                 print(
                     f"[{idx}/{len(videos)}] {video.name} | "
@@ -157,38 +176,34 @@ def main():
                     flush=True
                 )
 
-                # Deu certo. Sai do loop de retry.
                 break
 
             except errors.ServerError as e:
 
-                # Captura principalmente erros 5xx do servidor.
                 status = getattr(e, "code", None)
 
                 print(
                     f"[{idx}/{len(videos)}] {video.name} | "
-                    f"Erro temporário do Gemini: {status or e}",
+                    f"Erro temporário do servidor Gemini: "
+                    f"{status or e}",
                     file=sys.stderr,
                     flush=True
                 )
 
                 if tentativa >= MAX_TENTATIVAS:
-                    print(
-                        f"[{idx}/{len(videos)}] {video.name} | "
-                        f"ERRO: limite de tentativas atingido.",
-                        file=sys.stderr,
-                        flush=True
-                    )
                     raise
 
-                # Backoff exponencial com jitter:
-                # aproximadamente 5, 10, 20, 40, 80... segundos
-                espera_base = min(5 * (2 ** (tentativa - 1)), 120)
-                espera = espera_base + random.uniform(0, 3)
+                espera_base = min(
+                    10 * (2 ** (tentativa - 1)),
+                    180
+                )
+
+                espera = espera_base + random.uniform(0, 5)
 
                 print(
                     f"[{idx}/{len(videos)}] {video.name} | "
-                    f"Nova tentativa após {espera:.1f}s...",
+                    f"Nova tentativa usando o mesmo vídeo ACTIVE "
+                    f"em {espera:.1f}s...",
                     file=sys.stderr,
                     flush=True
                 )
@@ -197,25 +212,36 @@ def main():
 
             except Exception as e:
 
-                # Erros inesperados não ficam sendo repetidos indefinidamente.
                 print(
                     f"[{idx}/{len(videos)}] {video.name} | "
-                    f"ERRO NÃO RECUPERÁVEL NA ANÁLISE: {e}",
+                    f"Erro durante a análise: "
+                    f"{type(e).__name__}: {e}",
                     file=sys.stderr,
                     flush=True
                 )
 
                 raise
 
+
+        if not resposta_texto:
+            raise RuntimeError(
+                f"Nenhuma resposta foi produzida para {video.name}."
+            )
+
+
         print(
             f"[{idx}/{len(videos)}] {video.name} | "
-            f"Análise concluída "
-            f"({time.time() - analise_inicio:.1f}s). "
             f"Validando CSV...",
             file=sys.stderr,
             flush=True
         )
-        rows=list(csv.reader(clean(r.text).splitlines()))
+
+
+        rows = list(
+            csv.reader(
+                clean(resposta_texto).splitlines()
+            )
+        )
         if len(rows)<2: raise ValueError(f'Parte {idx} sem atividades')
         for row in rows[1:]:
             if len(row)<5: continue
